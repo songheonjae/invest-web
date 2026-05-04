@@ -1,0 +1,120 @@
+{
+  "endpoint": "POST /recommend",
+  "description": "사용자 조건 기반 주식 추천. 스코어링 → 경량 분석 → 다양성 제어 → Claude 리포트 순으로 실행됩니다.",
+
+  "request": {
+    "amount": 3000000,
+    "risk": "conservative",
+    "period": "long",
+    "market": "KR",
+    "prefer_tags": ["배당"],
+    "exclude_tags": ["바이오"],
+    "exclude_sectors": [],
+    "holdings": []
+  },
+
+  "request_schema": {
+    "amount": "integer (원, 양수)",
+    "risk": "'conservative' | 'neutral' | 'aggressive'",
+    "period": "'short' | 'medium' | 'long'",
+    "market": "'KR' | 'US' | 'ALL'",
+    "prefer_tags": "string[] — 선호 태그 (AI, 배당, 성장주, 방산, 반도체, 저PER 등)",
+    "exclude_tags": "string[] — 제외 태그",
+    "exclude_sectors": "string[] — 제외 섹터",
+    "holdings": "string[] — 보유 중인 ticker (업종 중복 패널티 적용)"
+  },
+
+  "response_schema": {
+    "summary": "string — 요청 조건 요약",
+    "recommendations": [
+      {
+        "ticker": "string",
+        "name": "string",
+        "sector": "string",
+        "tier": "1 | 2 | 3",
+        "score": "float — post_score (pre + 분석 보정)",
+        "reasons": "string[] — 추천 이유 최대 3개",
+        "risks": "string[] — 리스크 최대 2개",
+        "buy_type": "'즉시 검토형' | '확인 후 매수형' | '관찰 우선형'",
+        "weight_pct": "float — 분할매수 비중 (%)",
+        "amount_krw": "integer — 배분 금액 (원)",
+        "split": [
+          { "차수": "string", "금액": "integer", "조건": "string" }
+        ]
+      }
+    ],
+    "excluded": [
+      {
+        "ticker": "string",
+        "name": "string",
+        "sector": "string",
+        "score": "float",
+        "exclusion_reason": "string"
+      }
+    ],
+    "split_buy_plan": "SplitPlanItem[] — 전체 추천 종목의 분할매수 계획 배열 (recommendations[].split과 동일 데이터, 편의상 중복 제공)",
+    "notes": "string — 면책 문구",
+    "report": "string — Claude 생성 마크다운 리포트 (실패 시 빈 문자열 \"\")"
+  },
+
+  "response_example": {
+    "summary": "3,000,000원 | conservative | long | KR",
+    "recommendations": [
+      {
+        "ticker": "032640",
+        "name": "LG유플러스",
+        "sector": "통신",
+        "tier": 2,
+        "score": 108.2,
+        "reasons": [
+          "배당 이력이 있어 보수적 투자 성향에 적합합니다.",
+          "장기 보유 시 배당 수익으로 안정적 수익 확보가 가능합니다.",
+          "경기 하락 국면에서도 상대적으로 안정적인 종목입니다."
+        ],
+        "risks": [],
+        "buy_type": "즉시 검토형",
+        "weight_pct": 20.0,
+        "amount_krw": 600000,
+        "split": [
+          { "차수": "1차", "금액": 200000, "조건": "현재 가격 진입" },
+          { "차수": "2차", "금액": 200000, "조건": "-5% 추가 하락 시" },
+          { "차수": "3차", "금액": 200000, "조건": "추세 확인 후" }
+        ]
+      }
+    ],
+    "excluded": [
+      {
+        "ticker": "316140",
+        "name": "우리금융지주",
+        "sector": "금융",
+        "score": 101.9,
+        "exclusion_reason": "업종(금융) 중복으로 분산 효과 감소 - 점수는 높았으나 제외"
+      }
+    ],
+    "split_buy_plan": "...(recommendations와 동일 구조)...",
+    "notes": "이 추천은 정적 후보군과 공개 재무 데이터를 기반으로 한 판단 보조 결과입니다. 투자 결정의 최종 책임은 투자자 본인에게 있습니다.",
+    "report": "# 📊 맞춤형 투자 추천 리포트\n..."
+  },
+
+  "empty_result_example": {
+    "note": "입력값 검증 실패 → 422 (FastAPI 자동). 조건은 정상인데 후보 없음 → 200 + 아래 구조",
+    "summary": "조건에 맞는 후보가 없습니다.",
+    "recommendations": [],
+    "excluded": [],
+    "split_buy_plan": [],
+    "notes": "조건을 변경하거나 제외 태그를 줄여보세요.",
+    "report": ""
+  },
+
+  "buy_type_logic": {
+    "관찰 우선형": "validation_severity=severe OR confidence_score < 30",
+    "즉시 검토형": "score >= 70 AND validation 정상",
+    "확인 후 매수형": "그 외 (중간 케이스)"
+  },
+
+  "split_schedule_logic": {
+    "< 100,000원": "1회 — 일괄 진입",
+    "< 500,000원": "2회 — 현재가 / -5% 추가 하락",
+    ">= 500,000원": "3회 — 현재가 / -5% 추가 하락 / 추세 확인 후"
+  }
+}
