@@ -62,9 +62,9 @@ class LightResult:
     attractiveness_score: int | None
     validation_severity: str | None
     fundamental: dict
+    financials: dict = field(default_factory=dict)   # DART/yfinance 원본 재무 데이터
     current_price: int | None = None
     error: bool = False
-    # Phase 2.5 timing 필드 (기본값 있음 → 기존 생성 코드 영향 없음)
     timing_score: float = 0.0
     timing_flags: list = field(default_factory=list)
     timing_summary: str = ""
@@ -232,6 +232,7 @@ async def _light_kr(ticker: str, sector: str) -> LightResult:
             attractiveness_score=conf["attractiveness"]["score"],
             validation_severity=severity,
             fundamental=fundamental,
+            financials=financials,
             current_price=current_price,
         )
     except Exception:
@@ -267,6 +268,7 @@ async def _light_us(ticker: str, sector: str) -> LightResult:
             attractiveness_score=conf["attractiveness"]["score"],
             validation_severity=severity,
             fundamental=fundamental,
+            financials=financials,
             current_price=current_price,
         )
     except Exception:
@@ -426,16 +428,182 @@ def _sector_match_strength(candidate: Candidate, ps: str) -> str:
     return "none"
 
 
+# ──────────────────────────────────────────────
+# Phase 2 데이터에서 검증된 사실 추출
+# 추가 API 호출 없음 — LightResult에 이미 있는 데이터만 사용
+# ──────────────────────────────────────────────
+_POSITIVE_TIMING: set[str] = {
+    "정배열", "MACD상승", "RSI적정", "골든크로스", "거래량급증",
+    "조정구간", "BB하단반등", "BB하단권", "RSI과매도",
+}
+_NEGATIVE_TIMING: set[str] = {
+    "역배열", "MACD하락", "RSI과매수", "BB과열", "데드크로스",
+    "거래량부재", "52주고점근접", "장기하락", "BB상단근접",
+}
+
+
+def _build_verified_facts(
+    candidate: Candidate,
+    res: LightResult,
+    weight_pct: float | None = None,
+) -> list[dict]:
+    """
+    Phase 2에서 가져온 fundamental/financials/timing 데이터만 사용.
+    compact key: t=type, f=fact text, src=source, conf=confidence, v=numeric value
+    """
+    facts: list[dict] = []
+
+    def _n(val) -> float | None:
+        if val is None:
+            return None
+        try:
+            return float(str(val).replace(",", "").replace("%", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    fund = res.fundamental
+    src = "KIS" if candidate.market == "KR" else "yfinance"
+    annual = [r for r in res.financials.get("annual", []) if "(E)" not in r.get("period", "")]
+
+    # 밸류에이션
+    per = _n(fund.get("per"))
+    if per is not None and 0 < per < 500:
+        facts.append({"t": "valuation", "f": f"PER {per:.1f}배", "src": src, "conf": "high", "v": per})
+    pbr = _n(fund.get("pbr"))
+    if pbr is not None and 0 < pbr < 50:
+        facts.append({"t": "valuation", "f": f"PBR {pbr:.1f}배", "src": src, "conf": "high", "v": pbr})
+    div = _n(fund.get("dividend_yield"))
+    if div is not None and div > 0:
+        facts.append({"t": "dividend", "f": f"배당수익률 {div:.1f}%", "src": src, "conf": "high", "v": div})
+
+    # 재무 시계열 — DART/yfinance 확정치만
+    if len(annual) >= 2:
+        curr, prev = annual[-1], annual[-2]
+        period = curr.get("period", "")
+
+        def _yoy(key: str) -> float | None:
+            c, p = _n(curr.get(key)), _n(prev.get(key))
+            if c is None or p is None or p == 0:
+                return None
+            return round((c - p) / abs(p) * 100, 1)
+
+        op_g = _yoy("영업이익")
+        if op_g is not None and abs(op_g) >= 5:
+            sign = "+" if op_g > 0 else ""
+            facts.append({"t": "financial", "f": f"영업이익 YoY {sign}{op_g}% ({period})", "src": "DART", "conf": "high", "v": op_g})
+        rev_g = _yoy("매출액")
+        if rev_g is not None and abs(rev_g) >= 5:
+            sign = "+" if rev_g > 0 else ""
+            facts.append({"t": "financial", "f": f"매출액 YoY {sign}{rev_g}% ({period})", "src": "DART", "conf": "high", "v": rev_g})
+
+    if annual:
+        latest = annual[-1]
+        period = latest.get("period", "")
+        op_m = _n(latest.get("영업이익률"))
+        if op_m is not None:
+            facts.append({"t": "financial", "f": f"영업이익률 {op_m:.1f}% ({period})", "src": "DART", "conf": "high", "v": op_m})
+        roe = _n(latest.get("ROE"))
+        if roe is not None:
+            facts.append({"t": "financial", "f": f"ROE {roe:.1f}% ({period})", "src": "DART", "conf": "high", "v": roe})
+        debt = _n(latest.get("부채비율"))
+        if debt is not None:
+            facts.append({"t": "financial", "f": f"부채비율 {debt:.1f}% ({period})", "src": "DART", "conf": "high", "v": debt})
+
+    # 기술적 지표 (chart → calc_indicators)
+    for flag in res.timing_flags:
+        facts.append({"t": "timing", "f": flag, "src": "chart", "conf": "medium", "v": res.timing_score})
+
+    # 재무 검증 결과
+    if res.validation_severity:
+        facts.append({"t": "validation", "f": f"재무검증:{res.validation_severity}", "src": "validation", "conf": "high", "v": res.validation_severity})
+
+    # 포트폴리오 집중 리스크
+    if weight_pct is not None and weight_pct >= 60:
+        facts.append({"t": "risk_flag", "f": f"포트폴리오 비중 {weight_pct:.1f}% — 집중도 높음", "src": "allocation", "conf": "high", "v": weight_pct})
+
+    # 종목 속성 (업종 특성 — 재무 데이터 아님)
+    _ATTR = {"경기민감", "변동성높음", "고PER", "바이오", "블록체인", "암호화폐"}
+    for tag in set(candidate.tags) & _ATTR:
+        facts.append({"t": "sector_attr", "f": f"종목속성:{tag}", "src": "candidate_pool", "conf": "medium", "v": tag})
+
+    return facts
+
+
+# timing 플래그 → 사용자 친화적 레이블 (주어 조사 포함)
+_TIMING_FLAG_LABELS: dict[str, str] = {
+    "정배열":    "단기 이동평균 정배열이",
+    "MACD상승":  "MACD 단기 모멘텀 개선 신호가",
+    "RSI적정":   "RSI 적정 구간이",
+    "골든크로스": "이동평균 골든크로스가",
+    "거래량급증": "거래량 급증이",
+    "조정구간":  "52주 고점 대비 조정 구간이",
+    "BB하단반등": "볼린저밴드 하단 반등 신호가",
+    "BB하단권":  "볼린저밴드 하단권 위치가",
+    "RSI과매도":  "RSI 과매도 구간이",
+}
+_TIMING_NEG_LABELS: dict[str, str] = {
+    "역배열":      "단기 이동평균 역배열이",
+    "MACD하락":    "MACD 하락 모멘텀이",
+    "RSI과매수":   "RSI 과매수 구간이",
+    "BB과열":      "볼린저밴드 상단 돌파 과열이",
+    "데드크로스":  "이동평균 데드크로스가",
+    "거래량부재":  "거래량 부족 상태가",
+    "52주고점근접": "52주 신고가 근접 구간이",
+    "장기하락":    "장기 하락 추세가",
+    "BB상단근접":  "볼린저밴드 상단 근접이",
+}
+# 업종별 사업 특성 문장 (4순위 — 단정 금지, "영향을 받을 수 있습니다" 수준)
+_SECTOR_CHAR: dict[str, str] = {
+    "조선":     "글로벌 선박 발주 및 수주 사이클에 영향을 받을 수 있습니다.",
+    "반도체":   "반도체 업황 사이클 및 고객사 설비 투자에 영향을 받을 수 있습니다.",
+    "2차전지":  "전기차 수요 및 배터리 소재 가격 변동에 영향을 받을 수 있습니다.",
+    "방산":     "글로벌 방산 예산 및 수출 계약 성사 여부에 영향을 받을 수 있습니다.",
+    "바이오":   "임상 진행 상황 및 규제 당국 결정에 영향을 받을 수 있습니다.",
+    "금융":     "금리 변동 및 신용 사이클에 영향을 받을 수 있습니다.",
+    "자동차":   "글로벌 자동차 수요 및 EV 전환 속도에 영향을 받을 수 있습니다.",
+    "IT플랫폼": "광고 경기 및 플랫폼 규제 환경에 영향을 받을 수 있습니다.",
+    "테크":     "AI 투자 사이클 및 기술 수요 변동에 영향을 받을 수 있습니다.",
+    "에너지":   "유가 및 에너지 정책 변화에 영향을 받을 수 있습니다.",
+    "화학":     "원유 및 원자재 가격 변동에 영향을 받을 수 있습니다.",
+    "건설":     "부동산 경기 및 금리 변동에 영향을 받을 수 있습니다.",
+    "항공":     "유가 및 여객 수요 변동에 영향을 받을 수 있습니다.",
+    "엔터":     "아티스트 활동 및 콘텐츠 흥행 결과에 영향을 받을 수 있습니다.",
+    "뷰티":     "중국 소비 경기 및 글로벌 소비 트렌드에 영향을 받을 수 있습니다.",
+    "소비재":   "소비 경기 및 원자재 비용 변동에 영향을 받을 수 있습니다.",
+    "통신":     "가입자 경쟁 및 설비 투자 사이클에 영향을 받을 수 있습니다.",
+    "로봇":     "자동화 투자 수요 및 기술 상용화 속도에 영향을 받을 수 있습니다.",
+    "의료기기": "수출 허가 및 글로벌 의료 수요에 영향을 받을 수 있습니다.",
+    "기계":     "설비 투자 사이클 및 수출 수요에 영향을 받을 수 있습니다.",
+    "철강":     "철강 가격 및 글로벌 수요 변동에 영향을 받을 수 있습니다.",
+    "해운":     "글로벌 물동량 및 운임 사이클에 영향을 받을 수 있습니다.",
+    "리츠":     "금리 변동 및 부동산 시장 환경에 영향을 받을 수 있습니다.",
+    "산업재":   "글로벌 제조업 투자 및 경기 사이클에 영향을 받을 수 있습니다.",
+}
+
+
 def _generate_reasons(
     candidate: Candidate,
     user: UserInput,
     result: LightResult,
+    verified_facts: list[dict] | None = None,
+    buy_type: str = "확인 후 매수형",
 ) -> tuple[list[str], list[str]]:
+    """
+    verified_facts 우선 사용. 없는 내용은 추천 이유로 만들지 않음.
+    candidate.tags는 업종/사업 특성 설명 보조 용도로만 사용.
+    우선순위: 1) DART/KIS/yfinance 긍정 fact  2) chart timing  3) 업종 특성
+    """
+    facts = verified_facts or []
     tags = set(candidate.tags)
     reasons: list[str] = []
     risks: list[str] = []
 
-    # 관심 업종 매칭 — 강도에 따라 문장 분기
+    def _ft(type_: str) -> list[dict]:
+        return [f for f in facts if f.get("t") == type_]
+
+    # ── 1순위: DART/KIS/yfinance 확인된 긍정 fact ─────────────────
+
+    # 관심 업종 매칭 (구조적)
     for ps in user.prefer_sectors:
         strength = _sector_match_strength(candidate, ps)
         if strength == "direct":
@@ -448,84 +616,139 @@ def _generate_reasons(
                 core_aliases = SECTOR_ALIASES.get(ps, set()) | {ps}
                 matched_tag = next((t for t in candidate.tags if t in core_aliases), None)
                 tag_desc = _TAG_BUSINESS_DESC.get(matched_tag or ps, f"{matched_tag or ps} 관련 사업")
-                reasons.append(
-                    f"{display}으로 분류되어 있으나, {tag_desc} 노출이 있는 후보입니다."
-                )
+                reasons.append(f"{display}으로 분류되어 있으나, {tag_desc} 노출이 있는 후보입니다.")
             else:
                 reasons.append(f"관심 업종({ps})과 연관성이 있는 후보입니다.")
             break
-        # strength == "none" → 관심 업종 이유 생략
 
-    # 사용자 prefer_styles 매칭 → 스타일 이유 삽입
-    matched_styles = [s for s in user.prefer_styles if s in tags]
-    if matched_styles:
-        reasons.append(f"선호 스타일({', '.join(matched_styles)})에 부합하는 종목입니다.")
+    # 영업이익 YoY 개선 (DART 확정치, > 10%)
+    if len(reasons) < 4:
+        for f in _ft("financial"):
+            if "영업이익 YoY" in f["f"] and f.get("v", 0) > 10:
+                reasons.append(
+                    f"DART 기준 {f['f']}가 확인되어 실적 개선 흐름이 실제 데이터로 확인되었습니다."
+                )
+                break
 
-    for req_tags, req_risk, sentence in _REASON_RULES:
-        if len(reasons) >= 3:
-            break
-        if req_tags & tags:
-            if not req_risk or req_risk in (user.risk, user.period):
-                # 철강 sector + 2차전지 태그 → 오해 방지 문구 대체
-                if req_tags == {"2차전지"} and candidate.sector == "철강":
-                    reasons.append(
-                        "철강 업종 후보이면서, 일부 2차전지 소재 사업도 함께 보유한 종목입니다."
-                    )
-                else:
-                    reasons.append(sentence)
-
-    for req_tags, sentence in _RISK_RULES:
-        if req_tags & tags:
-            risks.append(sentence)
-        if len(risks) >= 2:
-            break
-
-    # sub-sector 세분화 이유 — 슬롯이 남아 있을 때만 삽입
-    if len(reasons) < 3:
-        sub_r = _sub_sector_reason(candidate)
-        if sub_r and not any(sub_r[:15] in r for r in reasons):
-            reasons.append(sub_r)
-
-    # 분석 결과 보완
-    if result.confidence_score is not None and result.confidence_score >= 60:
-        reasons.append("데이터 신뢰도가 높아 분석 기반이 탄탄합니다.")
-    if result.validation_severity == "severe":
-        risks.append("재무 데이터에 이상 징후가 감지되어 추가 확인이 필요합니다.")
-
-    # timing 보완 (reasons 슬롯이 남아있을 때만)
-    if result.timing_summary and len(reasons) < 3:
-        t_flags = set(result.timing_flags)
-        if result.timing_score >= 4:
-            reasons.append(f"기술적 타이밍 양호 — {result.timing_summary}.")
-        elif result.timing_score <= -4 and len(risks) < 2:
-            risks.append(f"기술적 진입 부담 — {result.timing_summary}.")
-
-    # timing 리스크 세부
-    if len(risks) < 2:
-        t_flags = set(result.timing_flags)
-        if "RSI과매수" in t_flags:
-            risks.append("RSI 과매수 구간 — 단기 조정 가능성에 유의하세요.")
-        elif "BB과열" in t_flags:
-            risks.append("볼린저 상단 돌파 구간 — 단기 과열 주의가 필요합니다.")
-
-    # 리스크 fallback — tags 우선 탐색 후 sector 확인 (tags가 실제 사업을 더 잘 반영)
-    if not risks:
-        fallback_msg = next(
-            (_SECTOR_FALLBACK_RISKS[t] for t in candidate.tags if t in _SECTOR_FALLBACK_RISKS),
-            _SECTOR_FALLBACK_RISKS.get(candidate.sector),
+    # 매출액 YoY 개선 (> 10%, 영업이익 fact가 없을 때만)
+    if len(reasons) < 4:
+        op_confirmed = any(
+            "영업이익 YoY" in f["f"] and f.get("v", 0) > 10 for f in _ft("financial")
         )
-        if fallback_msg:
-            risks.append(
-                "정량 필터상 치명적 제외 사유는 확인되지 않았으나, "
-                f"업종 특성상 확인이 필요합니다: {fallback_msg}"
-            )
-        else:
-            risks.append(
-                "정량 필터상 치명적 제외 사유는 확인되지 않았으나, "
-                "투자 전 관련 공시 및 시황을 직접 확인하세요."
+        if not op_confirmed:
+            for f in _ft("financial"):
+                if "매출액 YoY" in f["f"] and f.get("v", 0) > 10:
+                    reasons.append(
+                        f"DART 기준 {f['f']}가 확인되어 매출 성장이 데이터로 뒷받침됩니다."
+                    )
+                    break
+
+    # 밸류에이션 — 수치 언급만, 단정 없음 (업종 비교 없이는 낮다/높다 금지)
+    if len(reasons) < 4:
+        per_f = next((f for f in _ft("valuation") if "PER" in f["f"]), None)
+        if per_f:
+            src = per_f.get("src", "KIS")
+            reasons.append(
+                f"{src} 기준 {per_f['f']}가 확인되어 밸류에이션 참고 지표로 활용되었습니다."
             )
 
-    return reasons[:3], risks[:2]
+    # 배당 — 2% 이상 확인 시 표현, 단정 없음
+    if len(reasons) < 4:
+        div_f = next(iter(_ft("dividend")), None)
+        if div_f and div_f.get("v", 0) >= 2.0:
+            src = div_f.get("src", "KIS")
+            reasons.append(
+                f"{src} 기준 {div_f['f']}가 확인되어 배당 이력 참고 지표로 활용되었습니다."
+            )
+
+    # 선호 스타일 (구조적)
+    if len(reasons) < 4:
+        matched_styles = [s for s in user.prefer_styles if s in tags]
+        if matched_styles:
+            reasons.append(f"선호 스타일({', '.join(matched_styles)})에 부합하는 종목입니다.")
+
+    # ── 2순위: chart indicator timing fact ─────────────────────────
+    if len(reasons) < 4 and result.timing_flags:
+        pos_flags = [f["f"] for f in _ft("timing") if f["f"] in _POSITIVE_TIMING]
+        if result.timing_score >= 4 and pos_flags:
+            flag = pos_flags[0]
+            label = _TIMING_FLAG_LABELS.get(flag, f"{flag}이")
+            reasons.append(
+                f"차트 지표상 {label} 확인되었지만, "
+                f"단기 변동성을 고려해 {buy_type}으로 분류되었습니다."
+            )
+
+    # ── 4순위: 업종 특성 (단정 금지 — "영향을 받을 수 있습니다" 수준) ─
+    if len(reasons) < 4:
+        char_msg = _SECTOR_CHAR.get(candidate.sector)
+        if char_msg:
+            reasons.append(f"{candidate.sector} 업종 특성상 {char_msg}")
+
+    # ── 리스크 ────────────────────────────────────────────────────
+
+    # 1. 재무 검증 이슈 (실제 validation 데이터)
+    val_f = next(iter(_ft("validation")), None)
+    if val_f:
+        sev = str(val_f.get("v", ""))
+        if "severe" in sev:
+            risks.append("재무 데이터 검증 이슈(severe) — 수치 신뢰도 확인이 필요합니다.")
+        elif "medium" in sev:
+            risks.append("재무 데이터 일부 불일치 — 공시 원문 대조를 권장합니다.")
+
+    # 2. 부채비율 (DART, 200% 초과)
+    if len(risks) < 2:
+        for f in _ft("financial"):
+            if "부채비율" in f["f"] and f.get("v", 0) > 200:
+                risks.append(
+                    f"DART 기준 부채비율이 {f['v']:.1f}%로 확인되어, "
+                    "재무 레버리지 부담을 별도로 점검할 필요가 있습니다."
+                )
+                break
+
+    # 3. 영업이익 감소 (DART, < -10%)
+    if len(risks) < 2:
+        for f in _ft("financial"):
+            if "영업이익 YoY" in f["f"] and f.get("v", 0) < -10:
+                risks.append(f"DART 기준 {f['f']}로, 실적 부진이 데이터로 확인됩니다.")
+                break
+
+    # 4. 종목 속성 리스크 (업종 구조적 특성)
+    if len(risks) < 2:
+        attr_vals = {f.get("v", "") for f in _ft("sector_attr")}
+        if "변동성높음" in attr_vals:
+            risks.append("단기 변동성이 높은 종목 특성이 있어 손실 가능성을 별도로 고려해야 합니다.")
+        elif "경기민감" in attr_vals:
+            risks.append(
+                "경기 사이클에 민감한 업종 특성이 있어 업황 둔화 시 변동성이 커질 수 있습니다."
+            )
+        elif "바이오" in attr_vals:
+            risks.append("임상·규제 결과에 따라 주가 변동이 클 수 있습니다.")
+        elif "블록체인" in attr_vals or "암호화폐" in attr_vals:
+            risks.append("규제 리스크와 가격 변동성이 매우 큰 자산군입니다.")
+
+    # 5. 기술적 부정 신호 (timing_flags 있을 때만)
+    if len(risks) < 2 and result.timing_flags:
+        neg_flags = [f["f"] for f in _ft("timing") if f["f"] in _NEGATIVE_TIMING]
+        if result.timing_score <= -4 and neg_flags:
+            flag = neg_flags[0]
+            label = _TIMING_NEG_LABELS.get(flag, f"{flag}이")
+            risks.append(f"차트 지표상 {label} 확인되었습니다. 진입 시점 확인이 필요합니다.")
+
+    # 6. 포트폴리오 집중 리스크
+    if len(risks) < 2:
+        conc_f = next((f for f in _ft("risk_flag") if "집중" in f["f"]), None)
+        if conc_f:
+            risks.append(conc_f["f"])
+
+    # fallback
+    if not risks:
+        fallback = _SECTOR_FALLBACK_RISKS.get(candidate.sector)
+        if fallback:
+            risks.append(f"업종 특성상 확인 필요: {fallback}")
+        else:
+            risks.append("투자 전 관련 공시 및 시황을 직접 확인하세요.")
+
+    return reasons[:4], risks[:2]
 
 
 # ──────────────────────────────────────────────
@@ -831,11 +1054,16 @@ async def _claude_recommend_report(
     rec_text = "\n".join(
         "- {name}({ticker}) [buy_type: {bt}]\n"
         "  선정근거: {summary}\n"
-        "  추천이유: {reasons} | 리스크: {risks}".format(
+        "  추천이유: {reasons} | 리스크: {risks}\n"
+        "  검증사실: {facts}".format(
             name=r["name"], ticker=r["ticker"], bt=r["buy_type"],
             summary=" / ".join(r.get("selection_summary", [])),
             reasons=", ".join(r["reasons"]),
             risks=", ".join(r["risks"]),
+            facts="; ".join(
+                f["f"] for f in r.get("verified_facts", [])
+                if f.get("t") in {"financial", "valuation", "dividend", "timing"}
+            ) or "데이터 없음",
         )
         for r in recommendations
     )
@@ -853,6 +1081,8 @@ async def _claude_recommend_report(
         "아래 구조화 데이터는 백엔드 알고리즘이 이미 결정한 결과야. "
         "네 역할은 이 결과를 자연스러운 언어로 설명하는 것이지, 재판단하거나 수치를 바꾸는 게 아니야. "
         "절대로: buy_type 변경 금지 / 비중·금액 수치 변경 금지 / 제외 종목을 추천으로 바꾸거나 그 반대 금지. "
+        "verified_facts, reasons, risks에 없는 구체적 사실은 생성하지 마. "
+        "입력에 없는 실적 수치, 계약명, 수주액, 날짜, 뉴스는 절대 쓰지 마. "
         "과장하지 말고, 불확실한 것은 불확실하다고 말해라. "
         "한국어로 작성하고, 섹션 구조를 유지해라."
     )
@@ -886,6 +1116,7 @@ buy_type, 비중(%), 금액은 위 값 그대로 인용하고 다른 수치를 �
 [작성 규칙]
 - 추천 종목 설명은 selection_summary를 중심으로 2~4줄 이내로 요약하라. 길게 늘리지 마라.
 - 없는 근거를 새로 만들지 마라. selection_summary·추천이유·리스크에 있는 내용만 사용하라.
+- 검증사실(verified_facts)에 없는 재무 수치, 실적 개선, 계약명, 뉴스는 절대 생성하지 마라.
 - 종합 점수 70 미만 종목을 강한 추천처럼 표현하지 마라.
 - 관심 업종 보장으로 선정된 경우(선정근거에 "우선 조건" 포함) "조건 충족 후보"라고 표현하라.
 - buy_type의 이유는 한 줄로만 설명하라.
@@ -1102,13 +1333,19 @@ async def recommend_stocks(
     # result_map: ticker → LightResult
     result_map = {c.ticker: r for c, _, r in batch_results}
 
-    # ── Phase 4: 이유 생성 ───────────────────
+    # ── Phase 5: 분할매수 초안 (Phase 4 앞으로 이동 — weight_pct를 facts에 활용) ─
+    final_candidates = [c for c, _ in final_pairs]
+    split_plan = calc_split_buy(user.amount, final_candidates)
+    split_map = {s["ticker"]: s for s in split_plan}
+
+    # ── Phase 4: verified_facts 생성 + 이유 생성 ─────────────────
     recommendations = []
     for c, score in final_pairs:
         res = result_map.get(c.ticker, LightResult(c.ticker, None, None, None, {}))
-        reasons, risks = _generate_reasons(c, user, res)
+        sp = split_map.get(c.ticker, {})
+        facts = _build_verified_facts(c, res, sp.get("weight_pct"))
 
-        # 매수 성격 판단 (timing 오버레이)
+        # buy_type 먼저 결정 — _generate_reasons의 timing 문장에 반영
         t_flags = set(res.timing_flags)
         _overheated = {"RSI과매수", "BB과열", "52주고점근접"}
         _weak_trend = {"역배열", "MACD하락", "데드크로스", "장기하락"}
@@ -1118,19 +1355,17 @@ async def recommend_stocks(
         if res.validation_severity == "severe" or (res.confidence_score or 0) < 30:
             buy_type = "관찰 우선형"
         elif is_weak and res.timing_score <= -4:
-            # 점수 무관하게 추세가 명백히 약할 때
             buy_type = "관찰 우선형"
         elif score >= 70 and not is_overheated:
-            # 점수 높고 과열 신호 없음 → 즉시 검토
             buy_type = "즉시 검토형"
         elif score >= 70 and is_overheated:
-            # 점수는 높지만 과열 → 한 템포 기다림
             buy_type = "확인 후 매수형"
         elif is_weak:
             buy_type = "확인 후 매수형"
         else:
             buy_type = "확인 후 매수형"
 
+        reasons, risks = _generate_reasons(c, user, res, facts, buy_type)
         is_guaranteed = c.ticker in sector_guaranteed_tickers
         selection_summary = _make_selection_summary(c, user, res, score, buy_type, is_guaranteed)
 
@@ -1144,6 +1379,10 @@ async def recommend_stocks(
             "risks": risks,
             "buy_type": buy_type,
             "selection_summary": selection_summary,
+            "weight_pct": sp.get("weight_pct"),
+            "amount_krw": sp.get("amount_krw"),
+            "split": sp.get("split", []),
+            "verified_facts": facts,
         })
 
     excluded = []
@@ -1178,17 +1417,7 @@ async def recommend_stocks(
             "exclusion_reason": _exclusion_reason(c, user, res, reason_type, [fc for fc, _ in final_pairs]),
         })
 
-    # ── Phase 5: 분할매수 초안 ───────────────
-    final_candidates = [c for c, _ in final_pairs]
-    split_plan = calc_split_buy(user.amount, final_candidates)
-
-    # 추천 dict에 분할매수 정보 병합
-    split_map = {s["ticker"]: s for s in split_plan}
-    for r in recommendations:
-        sp = split_map.get(r["ticker"], {})
-        r["weight_pct"] = sp.get("weight_pct")
-        r["amount_krw"] = sp.get("amount_krw")
-        r["split"] = sp.get("split", [])
+    # ── Phase 5: 분할매수 (Phase 4 이전에 계산됨) ───────────────
 
     # ── Phase 6: Claude 리포트 ───────────────
     report = await _claude_recommend_report(user, recommendations, excluded, split_plan, selection_notes)

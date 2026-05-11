@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 
 
@@ -12,14 +12,14 @@ class AddFundsRequest(BaseModel):
 
 
 class BuyRequest(BaseModel):
-    market: str          # "KR" | "US"
+    market: Literal["KR", "US"]
     ticker: str
     name: str
     quantity: int = Field(..., ge=1)
 
 
 class SellRequest(BaseModel):
-    market: str
+    market: Literal["KR", "US"]
     ticker: str
     quantity: int = Field(..., ge=1)
 
@@ -27,10 +27,12 @@ class SellRequest(BaseModel):
 class AccountOut(BaseModel):
     initial_cash: float
     cash: float
+    deposited: float
     stock_value: float
     total_asset: float
     total_profit_loss: float
     total_profit_rate: float
+    usd_krw_rate: Optional[float] = None
 
 
 class PositionOut(BaseModel):
@@ -45,6 +47,8 @@ class PositionOut(BaseModel):
     profit_loss: float
     profit_rate: float
     weight: float
+    usd_krw_rate: Optional[float] = None
+    price_stale: bool = False
 
 
 class TradeOut(BaseModel):
@@ -56,5 +60,7 @@ class TradeOut(BaseModel):
     price: float
     quantity: int
     amount: float
+    amount_krw: float
+    usd_krw_rate: float
     realized_profit: Optional[float]
     realized_profit_rate: Optional[float]

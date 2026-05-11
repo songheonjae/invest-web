@@ -2,17 +2,24 @@
 모의투자 서비스 — SQLite 영구 저장
 현금은 KRW 단일 계좌. 해외 종목 거래 시 실시간 환율(USD→KRW) 변환 후 차감.
 """
+import asyncio
 import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 DB_PATH = Path(__file__).resolve().parent.parent.parent / "paper_trading.db"
 
 # ── 환율 캐시 (5분 TTL) ───────────────────────────────────────
 _rate_cache: dict = {"rate": 1350.0, "ts": 0.0}
 _RATE_TTL = 300
+
+# ── 가격 캐시 (30초 TTL) ──────────────────────────────────────
+_price_cache: dict[str, tuple[float, float]] = {}
+_PRICE_TTL = 30
+
+# KIS API 동시 호출 수 제한 (rate limit 방지)
+_kis_sem = asyncio.Semaphore(2)
 
 
 async def _get_usd_krw_rate() -> float:
@@ -60,11 +67,12 @@ def _init_db() -> None:
                 cash         REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS paper_positions (
-                market    TEXT NOT NULL,
-                ticker    TEXT NOT NULL,
-                name      TEXT NOT NULL,
-                avg_price REAL NOT NULL,
-                quantity  INTEGER NOT NULL,
+                market        TEXT NOT NULL,
+                ticker        TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                avg_price     REAL NOT NULL,
+                quantity      INTEGER NOT NULL,
+                avg_cost_krw  REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (market, ticker)
             );
             CREATE TABLE IF NOT EXISTS paper_trades (
@@ -96,6 +104,35 @@ def _init_db() -> None:
             con.execute("ALTER TABLE paper_account ADD COLUMN deposited REAL NOT NULL DEFAULT 0")
         except Exception:
             pass
+        # avg_cost_krw: 매수 당시 환율 기준 주당 원화 비용 (환율 손익 정확 반영)
+        try:
+            con.execute("ALTER TABLE paper_positions ADD COLUMN avg_cost_krw REAL NOT NULL DEFAULT 0")
+            # 기존 포지션을 거래 내역에서 재구성
+            positions = con.execute("SELECT market, ticker FROM paper_positions").fetchall()
+            for p in positions:
+                market, ticker = p["market"], p["ticker"]
+                trades = con.execute(
+                    "SELECT trade_type, quantity, amount_krw FROM paper_trades "
+                    "WHERE market=? AND ticker=? AND trade_type IN ('BUY','SELL') ORDER BY id",
+                    (market, ticker),
+                ).fetchall()
+                total_qty = 0
+                total_cost_krw = 0.0
+                for t in trades:
+                    if t["trade_type"] == "BUY":
+                        total_cost_krw += t["amount_krw"]
+                        total_qty += t["quantity"]
+                    elif t["trade_type"] == "SELL" and total_qty:
+                        avg = total_cost_krw / total_qty
+                        total_cost_krw -= avg * t["quantity"]
+                        total_qty -= t["quantity"]
+                avg_cost_krw = total_cost_krw / total_qty if total_qty else 0
+                con.execute(
+                    "UPDATE paper_positions SET avg_cost_krw=? WHERE market=? AND ticker=?",
+                    (avg_cost_krw, market, ticker),
+                )
+        except Exception:
+            pass
 
 
 _init_db()
@@ -115,12 +152,18 @@ def _ensure_account(con: sqlite3.Connection, initial_cash: float = 10_000_000) -
 
 # ── 현재가 조회 ────────────────────────────────────────────────
 async def _fetch_price(market: str, ticker: str) -> float:
+    cache_key = f"{market}:{ticker}"
+    now = time.time()
+    cached = _price_cache.get(cache_key)
+    if cached and now - cached[1] < _PRICE_TTL:
+        return cached[0]
+
     if market == "KR":
-        from app.services.kis_fundamental import _raw_price_and_fundamental
-        stock, _ = await _raw_price_and_fundamental(ticker)
-        raw = stock.get("price", "")
+        async with _kis_sem:
+            from app.services.kis_fundamental import _raw_price_and_fundamental
+            stock, _ = await _raw_price_and_fundamental(ticker)
+            raw = stock.get("price", "")
     else:
-        import asyncio
         from app.services.foreign_analysis import get_foreign_stock_and_fundamental
         stock, _ = await asyncio.to_thread(get_foreign_stock_and_fundamental, ticker)
         raw = stock.get("price") or stock.get("current_price", "")
@@ -130,7 +173,16 @@ async def _fetch_price(market: str, ticker: str) -> float:
     price = float(str(raw).replace(",", ""))
     if price <= 0:
         raise ValueError("현재가를 가져오지 못해 거래할 수 없습니다.")
+    _price_cache[cache_key] = (price, now)
     return price
+
+
+async def _safe_price(pos) -> tuple[float, bool]:
+    """(price, is_stale). is_stale=True 이면 API 실패로 avg_price 대체."""
+    try:
+        return await _fetch_price(pos["market"], pos["ticker"]), False
+    except Exception:
+        return pos["avg_price"], True
 
 
 # ── 계좌 요약 ──────────────────────────────────────────────────
@@ -141,15 +193,12 @@ async def get_account_summary() -> dict:
 
     rate = await _get_usd_krw_rate() if any(p["market"] == "US" for p in positions) else 1.0
 
-    stock_value_krw = 0.0
-    for pos in positions:
-        try:
-            price = await _fetch_price(pos["market"], pos["ticker"])
-        except Exception:
-            price = pos["avg_price"]
-        stock_value_krw += _to_krw(price * pos["quantity"], pos["market"], rate)
-
-    stock_value_krw = round(stock_value_krw)
+    price_results = await asyncio.gather(*[_safe_price(p) for p in positions])
+    prices = [r[0] for r in price_results]
+    stock_value_krw = round(sum(
+        _to_krw(price * pos["quantity"], pos["market"], rate)
+        for price, pos in zip(prices, positions)
+    ))
     cash = account["cash"]
     initial = account["initial_cash"]
     deposited = account["deposited"] if "deposited" in account.keys() else 0.0
@@ -192,7 +241,7 @@ def add_funds(amount: float) -> dict:
                 amount, amount_krw, usd_krw_rate, realized_profit, realized_profit_rate)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "DEPOSIT",
-             "KR", "-", "자금 추가", 1, int(amount),
+             "KR", "-", "자금 추가", amount, 1,
              amount, amount, 1, None, None),
         )
     return {
@@ -246,15 +295,18 @@ async def buy(market: str, ticker: str, name: str, quantity: int) -> dict:
             new_avg = round(
                 (existing["avg_price"] * existing["quantity"] + price * quantity) / new_qty, 4
             )
+            existing_cost_krw = existing["avg_cost_krw"] if "avg_cost_krw" in existing.keys() else 0
+            new_avg_cost_krw = (existing_cost_krw * existing["quantity"] + amount_krw) / new_qty
             con.execute(
-                "UPDATE paper_positions SET avg_price=?, quantity=?, name=? WHERE market=? AND ticker=?",
-                (new_avg, new_qty, name or existing["name"], market, ticker),
+                "UPDATE paper_positions SET avg_price=?, quantity=?, name=?, avg_cost_krw=? WHERE market=? AND ticker=?",
+                (new_avg, new_qty, name or existing["name"], new_avg_cost_krw, market, ticker),
             )
             avg_price, qty_after = new_avg, new_qty
         else:
+            avg_cost_krw_per_share = amount_krw / quantity
             con.execute(
-                "INSERT INTO paper_positions (market, ticker, name, avg_price, quantity) VALUES (?,?,?,?,?)",
-                (market, ticker, name, price, quantity),
+                "INSERT INTO paper_positions (market, ticker, name, avg_price, quantity, avg_cost_krw) VALUES (?,?,?,?,?,?)",
+                (market, ticker, name, price, quantity, avg_cost_krw_per_share),
             )
             avg_price, qty_after = price, quantity
 
@@ -302,13 +354,18 @@ async def sell(market: str, ticker: str, quantity: int) -> dict:
         if quantity > pos["quantity"]:
             raise ValueError(f"보유 수량({pos['quantity']}주)보다 많이 매도할 수 없습니다.")
 
-        # 실현손익: 현재 환율 기준으로 통일 (순수 주가 변동만 반영)
-        realized_native = round((price - pos["avg_price"]) * quantity, 4)
-        realized_krw = _to_krw(realized_native, market, rate)
-        realized_rate = (
-            round((price - pos["avg_price"]) / pos["avg_price"] * 100, 2)
-            if pos["avg_price"] else 0
-        )
+        # 실현손익: 매수 시점 원화 비용 기준 (환율 손익 포함)
+        cost_per_share_krw = pos["avg_cost_krw"] if "avg_cost_krw" in pos.keys() and pos["avg_cost_krw"] else None
+        if cost_per_share_krw:
+            realized_krw = round(amount_krw - cost_per_share_krw * quantity)
+            realized_rate = round(realized_krw / (cost_per_share_krw * quantity) * 100, 2) if cost_per_share_krw else 0
+        else:
+            realized_native = round((price - pos["avg_price"]) * quantity, 4)
+            realized_krw = _to_krw(realized_native, market, rate)
+            realized_rate = (
+                round((price - pos["avg_price"]) / pos["avg_price"] * 100, 2)
+                if pos["avg_price"] else 0
+            )
         pos_name = pos["name"]
 
         remaining = pos["quantity"] - quantity
@@ -356,35 +413,35 @@ async def get_positions() -> list[dict]:
     has_us = any(p["market"] == "US" for p in positions)
     rate = await _get_usd_krw_rate() if has_us else 1.0
 
+    price_results = await asyncio.gather(*[_safe_price(p) for p in positions])
+
     total_asset = account["cash"]
     rows = []
-    for pos in positions:
-        try:
-            price = await _fetch_price(pos["market"], pos["ticker"])
-        except Exception:
-            price = pos["avg_price"]
+    for (price, stale), pos in zip(price_results, positions):
         evalu_krw = _to_krw(price * pos["quantity"], pos["market"], rate)
-        cost_krw  = _to_krw(pos["avg_price"] * pos["quantity"], pos["market"], rate)
+        stored_cost_krw = (pos["avg_cost_krw"] if "avg_cost_krw" in pos.keys() else 0) * pos["quantity"]
+        cost_krw = round(stored_cost_krw) if stored_cost_krw else _to_krw(pos["avg_price"] * pos["quantity"], pos["market"], rate)
         pl_krw    = evalu_krw - cost_krw
-        pl_rate   = round((price - pos["avg_price"]) / pos["avg_price"] * 100, 2) if pos["avg_price"] else 0
+        pl_rate   = round(pl_krw / cost_krw * 100, 2) if cost_krw else 0
         total_asset += evalu_krw
-        rows.append((pos, price, cost_krw, evalu_krw, pl_krw, pl_rate))
+        rows.append((pos, price, stale, cost_krw, evalu_krw, pl_krw, pl_rate))
 
     result = []
-    for pos, price, cost_krw, evalu_krw, pl_krw, pl_rate in rows:
+    for pos, price, stale, cost_krw, evalu_krw, pl_krw, pl_rate in rows:
         weight = evalu_krw / total_asset * 100 if total_asset else 0
         entry = {
             "market": pos["market"],
             "ticker": pos["ticker"],
             "name": pos["name"],
-            "avg_price": pos["avg_price"],      # 원래 통화 (KR=원, US=달러)
-            "current_price": price,              # 원래 통화
+            "avg_price": pos["avg_price"],
+            "current_price": price,
             "quantity": pos["quantity"],
-            "cost_amount": cost_krw,             # KRW 환산
-            "evaluation_amount": evalu_krw,      # KRW 환산
-            "profit_loss": pl_krw,               # KRW 환산
+            "cost_amount": cost_krw,
+            "evaluation_amount": evalu_krw,
+            "profit_loss": pl_krw,
             "profit_rate": pl_rate,
             "weight": round(weight, 1),
+            "price_stale": stale,
         }
         if pos["market"] == "US":
             entry["usd_krw_rate"] = round(rate)

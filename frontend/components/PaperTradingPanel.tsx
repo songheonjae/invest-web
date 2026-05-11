@@ -67,6 +67,7 @@ export default function PaperTradingPanel({ prefill, onClearPrefill, onJudgeHold
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); }, [subTab, load]);
 
   useEffect(() => {
     const onVisible = () => { if (document.visibilityState === "visible") load(); };
@@ -457,7 +458,12 @@ export default function PaperTradingPanel({ prefill, onClearPrefill, onJudgeHold
                             <p className="text-gray-500">{pos.ticker} · {pos.market}</p>
                           </td>
                           <td className="py-2 px-2">{fg ? `$${pos.avg_price.toFixed(2)}` : `${Math.round(pos.avg_price).toLocaleString()}`}</td>
-                          <td className="py-2 px-2">{fg ? `$${pos.current_price.toFixed(2)}` : `${Math.round(pos.current_price).toLocaleString()}`}</td>
+                          <td className="py-2 px-2">
+                            <span className={pos.price_stale ? "text-gray-500" : ""}>
+                              {fg ? `$${pos.current_price.toFixed(2)}` : `${Math.round(pos.current_price).toLocaleString()}`}
+                            </span>
+                            {pos.price_stale && <span className="text-gray-600 ml-0.5" title="현재가 조회 실패 — 평균단가로 표시">?</span>}
+                          </td>
                           <td className="py-2 px-2">{pos.quantity}</td>
                           <td className={`py-2 px-2 ${plColor}`}>
                             {pos.profit_loss >= 0 ? "+" : ""}{Math.round(pos.profit_loss).toLocaleString()}원

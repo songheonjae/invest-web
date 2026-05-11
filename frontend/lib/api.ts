@@ -234,6 +234,7 @@ export interface PaperPosition {
   profit_loss: number;
   profit_rate: number;
   weight: number;
+  price_stale?: boolean;
 }
 
 export interface PaperTrade {
