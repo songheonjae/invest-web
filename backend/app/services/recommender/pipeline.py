@@ -476,7 +476,8 @@ def _build_verified_facts(
     if div is not None and div > 0:
         facts.append({"t": "dividend", "f": f"배당수익률 {div:.1f}%", "src": src, "conf": "high", "v": div})
 
-    # 재무 시계열 — DART/yfinance 확정치만
+    # 재무 시계열 — KR=DART, US=yfinance
+    fin_src = "DART" if candidate.market == "KR" else "yfinance"
     if len(annual) >= 2:
         curr, prev = annual[-1], annual[-2]
         period = curr.get("period", "")
@@ -490,24 +491,24 @@ def _build_verified_facts(
         op_g = _yoy("영업이익")
         if op_g is not None and abs(op_g) >= 5:
             sign = "+" if op_g > 0 else ""
-            facts.append({"t": "financial", "f": f"영업이익 YoY {sign}{op_g}% ({period})", "src": "DART", "conf": "high", "v": op_g})
+            facts.append({"t": "financial", "f": f"영업이익 YoY {sign}{op_g}% ({period})", "src": fin_src, "conf": "high", "v": op_g})
         rev_g = _yoy("매출액")
         if rev_g is not None and abs(rev_g) >= 5:
             sign = "+" if rev_g > 0 else ""
-            facts.append({"t": "financial", "f": f"매출액 YoY {sign}{rev_g}% ({period})", "src": "DART", "conf": "high", "v": rev_g})
+            facts.append({"t": "financial", "f": f"매출액 YoY {sign}{rev_g}% ({period})", "src": fin_src, "conf": "high", "v": rev_g})
 
     if annual:
         latest = annual[-1]
         period = latest.get("period", "")
         op_m = _n(latest.get("영업이익률"))
         if op_m is not None:
-            facts.append({"t": "financial", "f": f"영업이익률 {op_m:.1f}% ({period})", "src": "DART", "conf": "high", "v": op_m})
+            facts.append({"t": "financial", "f": f"영업이익률 {op_m:.1f}% ({period})", "src": fin_src, "conf": "high", "v": op_m})
         roe = _n(latest.get("ROE"))
         if roe is not None:
-            facts.append({"t": "financial", "f": f"ROE {roe:.1f}% ({period})", "src": "DART", "conf": "high", "v": roe})
+            facts.append({"t": "financial", "f": f"ROE {roe:.1f}% ({period})", "src": fin_src, "conf": "high", "v": roe})
         debt = _n(latest.get("부채비율"))
         if debt is not None:
-            facts.append({"t": "financial", "f": f"부채비율 {debt:.1f}% ({period})", "src": "DART", "conf": "high", "v": debt})
+            facts.append({"t": "financial", "f": f"부채비율 {debt:.1f}% ({period})", "src": fin_src, "conf": "high", "v": debt})
 
     # 기술적 지표 (chart → calc_indicators)
     for flag in res.timing_flags:
@@ -621,12 +622,12 @@ def _generate_reasons(
                 reasons.append(f"관심 업종({ps})과 연관성이 있는 후보입니다.")
             break
 
-    # 영업이익 YoY 개선 (DART 확정치, > 10%)
+    # 영업이익 YoY 개선 (> 10%)
     if len(reasons) < 4:
         for f in _ft("financial"):
             if "영업이익 YoY" in f["f"] and f.get("v", 0) > 10:
                 reasons.append(
-                    f"DART 기준 {f['f']}가 확인되어 실적 개선 흐름이 실제 데이터로 확인되었습니다."
+                    f"{f.get('src', 'DART')} 기준 {f['f']}가 확인되어 실적 개선 흐름이 실제 데이터로 확인되었습니다."
                 )
                 break
 
@@ -639,7 +640,7 @@ def _generate_reasons(
             for f in _ft("financial"):
                 if "매출액 YoY" in f["f"] and f.get("v", 0) > 10:
                     reasons.append(
-                        f"DART 기준 {f['f']}가 확인되어 매출 성장이 데이터로 뒷받침됩니다."
+                        f"{f.get('src', 'DART')} 기준 {f['f']}가 확인되어 매출 성장이 데이터로 뒷받침됩니다."
                     )
                     break
 
@@ -695,21 +696,21 @@ def _generate_reasons(
         elif "medium" in sev:
             risks.append("재무 데이터 일부 불일치 — 공시 원문 대조를 권장합니다.")
 
-    # 2. 부채비율 (DART, 200% 초과)
+    # 2. 부채비율 (200% 초과)
     if len(risks) < 2:
         for f in _ft("financial"):
             if "부채비율" in f["f"] and f.get("v", 0) > 200:
                 risks.append(
-                    f"DART 기준 부채비율이 {f['v']:.1f}%로 확인되어, "
+                    f"{f.get('src', 'DART')} 기준 부채비율이 {f['v']:.1f}%로 확인되어, "
                     "재무 레버리지 부담을 별도로 점검할 필요가 있습니다."
                 )
                 break
 
-    # 3. 영업이익 감소 (DART, < -10%)
+    # 3. 영업이익 감소 (< -10%)
     if len(risks) < 2:
         for f in _ft("financial"):
             if "영업이익 YoY" in f["f"] and f.get("v", 0) < -10:
-                risks.append(f"DART 기준 {f['f']}로, 실적 부진이 데이터로 확인됩니다.")
+                risks.append(f"{f.get('src', 'DART')} 기준 {f['f']}로, 실적 부진이 데이터로 확인됩니다.")
                 break
 
     # 4. 종목 속성 리스크 (업종 구조적 특성)
